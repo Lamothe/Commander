@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Commander
+Exec=/home/michael/Projects/Commander/Commander.Gnome/bin/Debug/net10.0/Commander.Gnome
+Icon=com.lamothe.Commander
+Type=Application
+Terminal=false
+Categories=Utility;

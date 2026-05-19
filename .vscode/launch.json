@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": ".NET 10 Launch (Console)",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/Commander.Gnome/bin/Debug/net10.0/Commander.Gnome.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}/Commander.Gnome",
+            "stopAtEntry": false,
+            "console": "internalConsole"
+        }
+    ]
+}

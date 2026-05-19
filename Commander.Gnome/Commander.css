@@ -1,0 +1,36 @@
+.detail-content {
+    padding: 24px;
+}
+
+.terminal-output {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    font-family: monospace;
+    font-size: 11px;
+    padding: 6px;
+    border-radius: 12px;
+}
+
+row.command-running {
+    background-color: #26a269;
+    color: white;
+    font-weight: bold;
+}
+
+/* Ensure the chevron and any secondary text also turn white for readability */
+row.command-running label,
+row.command-running image.dim-label {
+    color: white;
+}
+
+row.command-failed {
+    background-color: #cc0000;
+    color: white;
+    font-weight: bold;
+}
+
+/* Ensure the chevron and any secondary text also turn white for readability */
+row.command-failed label,
+row.command-failed image.dim-label {
+    color: white;
+}
