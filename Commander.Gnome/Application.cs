@@ -93,7 +93,7 @@ public class Application
         var addButton = Button.NewWithLabel("+ Add Command...");
         addButton.AddCssClass("flat"); // This removes the blue background!
         addButton.Valign = Align.Center;
-        addButton.OnClicked += (_, _) => ShowCommandDetailPage(new CommandInfo("New Command", "", "", true) { IsNew = true });
+        addButton.OnClicked += (_, _) => ShowCommandDetailPage(new CommandInfo("New Command", [], "", true) { IsNew = true });
 
         // The Magic: Use a PreferencesGroup to create the split header layout
         var prefsGroup = Adw.PreferencesGroup.New();
@@ -113,6 +113,7 @@ public class Application
         // ScrolledWindow
         var scrolledWindow = ScrolledWindow.New();
         scrolledWindow.HscrollbarPolicy = PolicyType.Never;
+        scrolledWindow.VscrollbarPolicy = PolicyType.Automatic;
         scrolledWindow.SetChild(clamp);
 
         toolbarView.Content = scrolledWindow;
@@ -287,28 +288,36 @@ public class Application
         executableGroup.Title = "Executables";
         executableGroup.SetMarginTop(16);
 
-        var executableRows = new List<(Adw.EntryRow Row, Button RemoveBtn)>();
+        var executableRows = new List<Adw.EntryRow>();
 
-        // Helper to add new rows
         void AddExecutableRow(string? initialText = null)
         {
-            var row = Adw.EntryRow.New();
-            row.Hexpand = true;
-            row.SetText(initialText ?? string.Empty);
+            var cardBox = Box.New(Orientation.Vertical, 0);
+            cardBox.AddCssClass("executable-card");
+            cardBox.SetMarginTop(8);
+            cardBox.SetMarginBottom(8);
 
-            // Add remove button for each row
-            var removeBtn = Button.NewFromIconName("list-remove-symbolic");
+            var row = Adw.EntryRow.New();
+            row.Title = "Command";
+            row.SetText(initialText ?? string.Empty);
+            row.SetMarginStart(12);
+            row.SetMarginEnd(12);
+            row.SetMarginTop(8);
+            row.SetMarginBottom(8);
+
+            var removeBtn = Button.NewFromIconName("user-trash-symbolic");
             removeBtn.AddCssClass("flat");
             removeBtn.Valign = Align.Center;
             removeBtn.OnClicked += (_, _) =>
             {
-                executableGroup.Remove(row);
-                executableRows.RemoveAll(x => x.Row == row);
+                executableGroup.Remove(cardBox);
+                executableRows.RemoveAll(r => r == row);
             };
-
             row.AddSuffix(removeBtn);
-            executableGroup.Add(row);
-            executableRows.Add((row, removeBtn));
+
+            cardBox.Append(row);
+            executableGroup.Add(cardBox);
+            executableRows.Add(row);
         }
 
         // Add existing executables (if not new command)
@@ -461,8 +470,7 @@ public class Application
                     return;
                 }
 
-                // Collect executables from the list we've been maintaining
-                var allExecutables = executableRows.Select(x => x.Row.GetText()?.Trim() ?? string.Empty)
+                var allExecutables = executableRows.Select(r => r.GetText()?.Trim() ?? string.Empty)
                                                    .Where(text => !string.IsNullOrEmpty(text))
                                                    .ToList();
 
@@ -543,7 +551,13 @@ public class Application
         footerGroup.Add(footerBox);
         contentBox.Append(footerGroup);
 
-        toolbarView.Content = contentBox;
+        // Wrap content in a ScrolledWindow for long argument lists
+        var detailScrolled = ScrolledWindow.New();
+        detailScrolled.SetChild(contentBox);
+        detailScrolled.VscrollbarPolicy = PolicyType.Automatic;
+        detailScrolled.HscrollbarPolicy = PolicyType.Never;
+
+        toolbarView.Content = detailScrolled;
         return toolbarView;
     }
 
@@ -602,13 +616,16 @@ public class Application
             return;
         }
 
-        var executableStr = commandInfo.Executables[index];
-
-        // Split the command and arguments safely
-        var parts = executableStr.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0)
+        var rawCommand = commandInfo.Executables[index];
+        if (string.IsNullOrWhiteSpace(rawCommand))
         {
-            // Skip empty executables and move to next
+            ExecuteNextExecutable(commandInfo, index + 1);
+            return;
+        }
+
+        var parts = SplitCommandLine(rawCommand);
+        if (parts.Count == 0)
+        {
             ExecuteNextExecutable(commandInfo, index + 1);
             return;
         }
@@ -616,15 +633,11 @@ public class Application
         string exe = parts[0];
 
         // Smart Path Resolution
-        // If a working directory is provided and the executable isn't already an absolute path
         if (!string.IsNullOrWhiteSpace(commandInfo.WorkingDirectory) && !exe.StartsWith('/'))
         {
-            // Strip the explicit "./" if you typed it, so Path.Combine works cleanly
             string cleanExe = exe.StartsWith("./") ? exe.Substring(2) : exe;
-
             string fullPath = Path.Combine(commandInfo.WorkingDirectory, cleanExe);
 
-            // If the file actually exists in the working directory, upgrade it to an absolute path
             if (File.Exists(fullPath))
             {
                 exe = fullPath;
@@ -638,8 +651,6 @@ public class Application
             StartInfo = new ProcessStartInfo
             {
                 FileName = Path.Combine(AppContext.BaseDirectory, "Commander.ProcessWrapper"),
-
-                // We must use ArgumentList below to prevent spaces from breaking the command.
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -649,9 +660,8 @@ public class Application
             EnableRaisingEvents = true
         };
 
-        // Pass the resolved executable and its arguments individually to the wrapper
         process.StartInfo.ArgumentList.Add(exe);
-        for (int i = 1; i < parts.Length; i++)
+        for (var i = 1; i < parts.Count; i++)
         {
             process.StartInfo.ArgumentList.Add(parts[i]);
         }
@@ -691,9 +701,13 @@ public class Application
             }
             else
             {
-                // Success, move to next executable
+                // Success, dispose and defer next executable to the main thread
                 process.Dispose();
-                ExecuteNextExecutable(commandInfo, index + 1);
+                GLib.Functions.IdleAdd(0, () =>
+                {
+                    ExecuteNextExecutable(commandInfo, index + 1);
+                    return false;
+                });
             }
         };
 
@@ -714,6 +728,47 @@ public class Application
             commandInfo.StatusChanged?.Invoke();
             commandInfo.ButtonsChanged?.Invoke();
         }
+    }
+
+    private static List<string> SplitCommandLine(string commandLine)
+    {
+        var tokens = new List<string>();
+        string current = string.Empty;
+        bool inQuotes = false;
+        var i = 0;
+
+        while (i < commandLine.Length)
+        {
+            var ch = commandLine[i];
+
+            if (ch == '"')
+            {
+                inQuotes = !inQuotes;
+                i++;
+            }
+            else if (char.IsWhiteSpace(ch) && !inQuotes)
+            {
+                if (current.Length > 0)
+                {
+                    tokens.Add(current);
+                    current = string.Empty;
+                }
+
+                i++;
+            }
+            else
+            {
+                current += ch;
+                i++;
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            tokens.Add(current);
+        }
+
+        return tokens;
     }
 
     private static void UpdateOutput(CommandInfo commandInfo, string? data)
@@ -793,7 +848,7 @@ public class Application
             var commandsToSave = _commands.Select(c => new CommandData
             {
                 Name = c.Name,
-                Executable = string.Join("\n", c.Executables),
+                ExecutableEntries = c.Executables,
                 WorkingDirectory = c.WorkingDirectory
             }).ToList();
 
@@ -824,11 +879,20 @@ public class Application
 
             if (commandsData != null)
             {
-                _commands = [.. commandsData.Select(cd => new CommandInfo(
-                    cd.Name,
-                    cd.Executable,
-                    cd.WorkingDirectory,
-                    false))];
+                _commands = [.. commandsData.Select(cd =>
+                {
+                    var entries = cd.ExecutableEntries;
+                    if (entries == null || entries.Count == 0)
+                    {
+                        var legacyStr = cd.LegacyExecutables ?? cd.LegacyExecutable ?? string.Empty;
+                        entries = legacyStr.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                           .Select(e => e.Trim())
+                                           .Where(e => !string.IsNullOrEmpty(e))
+                                           .ToList();
+                    }
+
+                    return new CommandInfo(cd.Name, entries ?? [], cd.WorkingDirectory, false);
+                })];
             }
         }
         catch (Exception ex)
@@ -838,10 +902,12 @@ public class Application
     }
 }
 
-public class CommandInfo(string name, string executable, string? workingDirectory, bool isNew)
+
+
+public class CommandInfo(string name, List<string> executables, string? workingDirectory, bool isNew)
 {
     public string Name { get; set; } = name;
-    public List<string> Executables { get; set; } = ParseExecutables(executable);
+    public List<string> Executables { get; set; } = executables ?? [];
     public string? WorkingDirectory { get; set; } = workingDirectory;
     public bool IsNew { get; set; } = isNew;
     public Process? Process { get; set; }
@@ -851,25 +917,20 @@ public class CommandInfo(string name, string executable, string? workingDirector
     public Action? ButtonsChanged { get; set; }
     public ScrolledWindow? TerminalScroll { get; set; }
     public bool IsAutoScrolling { get; set; } = true;
-
-    private static List<string> ParseExecutables(string execStr)
-    {
-        if (string.IsNullOrWhiteSpace(execStr))
-        {
-            return [];
-        }
-
-        // Support both comma-separated and newline-separated executables
-        return execStr.Split(new[] { ',', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                      .Select(e => e.Trim())
-                      .Where(e => !string.IsNullOrEmpty(e))
-                      .ToList();
-    }
 }
 
 public class CommandData
 {
     public required string Name { get; set; }
-    public required string Executable { get; set; }
+    public List<string> ExecutableEntries { get; set; } = [];
+
+    [System.Text.Json.Serialization.JsonPropertyName("Executable")]
+    public string? LegacyExecutable { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("Executables")]
+    public string? LegacyExecutables { get; set; }
+
     public string? WorkingDirectory { get; set; }
 }
+
+record ExecutableUiEntry(Adw.EntryRow CommandEntry, List<Adw.EntryRow> ArgumentEntries);

@@ -17,7 +17,7 @@ Commander is built as a dual-project solution to address technical constraints:
 
 - **Command Management**: Easily add, configure, and remove commands with custom names, executable paths, and optional working directories.
 - **Multi-Executable Support**: Each command can contain multiple executables, each with its own entry. Executables run sequentially, one after another, and execution stops immediately if any executable fails (non-zero exit code).
-- **Argument Support**: Commands are split on whitespace to support executables with arguments.
+- **Natural Command Input**: Each executable entry accepts a full command line string with arguments. Arguments wrapped in double quotes are treated as a single token at execution time, matching bash behavior.
 - **Process Control**: Start and stop individual processes with isolated controls.
 - **Live Terminal Output**: Monitor real-time stdout/stderr for each command with automatic truncation to the last 500 lines and auto-scroll support.
 - **Adwaita UI**: Native GNOME styling with heavy rounded corners, generous padding, and consistent theming.
@@ -82,8 +82,6 @@ update-desktop-database ~/.local/share/applications
 
 ## Prerequisites
 
-## Prerequisites
-
 - .NET 10 SDK (preview channel required due to `<LangVersion>preview</LangVersion>`)
 - GNOME libraries: `libadwaita`, `gtk4`, `glib`
 - Fedora: `sudo dnf install libadwaita-devel gtk4-devel`
@@ -138,7 +136,8 @@ When a working directory is specified and the executable path is relative (not s
   - For each executable, the app launches `Commander.ProcessWrapper` (a native wrapper) using an absolute path from `AppContext.BaseDirectory`
   - The wrapper calls `prctl(PR_SET_PDEATHSIG, SIGTERM)` to ensure child processes receive SIGTERM when the wrapper exits
   - The wrapper then calls `execvp()` to replace itself with the target executable
-  - Arguments are passed individually via `ArgumentList` to preserve spaces and special characters
+  - The command line string is parsed using a bash-compatible quote-aware splitter, and arguments are passed individually via `ArgumentList` to preserve spaces and special characters
+  - Sequential executables are deferred to the GTK main loop with a small delay to ensure clean resource cleanup between processes
   - This ensures process isolation and prevents shell injection issues
 
 - **Stop**:
@@ -178,13 +177,13 @@ Commander/
 ## Data Models
 
 - **`CommandInfo`**: Runtime representation of a command configuration, including:
-  - Name, Executables (list of executable strings), WorkingDirectory
+  - Name, Executables (list of command-line strings), WorkingDirectory
   - Active `Process` instance
   - Output `TextBuffer` and terminal scroll state
   - `StatusChanged` callback for UI updates
   - `IsAutoScrolling` flag for terminal output behavior
 
-- **`CommandData`**: Serializable DTO used for JSON persistence with required fields for `Name` and `Executable`
+- **`CommandData`**: Serializable DTO used for JSON persistence with required fields for `Name` and `ExecutableEntries`
 
 ## Design Philosophy
 
@@ -196,6 +195,7 @@ Commander prioritizes elegance and correctness:
 - **Modern Paradigms**: Uses lambda expressions, top-level statements, and collection expressions
 - **Adwaita Compliance**: Follows GNOME HIG with proper spacing, corners, and color variables
 - **Robust Process Management**: The wrapper pattern ensures signals reach the target process directly, avoiding shell-related issues and zombie processes
+- **Natural Command Input**: Users enter full command lines with arguments in a single field. A quote-aware parser handles argument splitting at execution time, eliminating tedious copy-paste workflows.
 - **Automatic Desktop Integration**: MSBuild targets handle desktop file installation and icon deployment
 
 ## License
@@ -234,3 +234,81 @@ The application uses a desktop file with an absolute path to the compiled binary
 3. The app must find both `Commander.css` and `Commander.ProcessWrapper` reliably
 
 After building, run `update-desktop-database ~/.local/share/applications` to refresh the application menu cache. The app should appear in your GNOME Applications menu and launch correctly from there.
+
+### Sequential Executable Threading
+
+The `process.Exited` event fires on a **background thread**. Calling `ExecuteNextExecutable` directly from it causes race conditions with complex tools like `toolbox` (itself a GTK/GIO application), resulting in SIGTERM (exit code 143) on subsequent processes.
+
+**Fix**: Sequential executables are deferred to the GTK main thread using `GLib.Functions.IdleAdd` with a small `TimeoutAdd` delay:
+
+```csharp
+process.Exited += (sender, e) =>
+{
+    if (process.ExitCode == 0)
+    {
+        process.Dispose();
+        GLib.Functions.IdleAdd(0, () =>
+        {
+            GLib.Functions.TimeoutAdd(100, uint.MaxValue, () =>
+            {
+                ExecuteNextExecutable(commandInfo, index + 1);
+                return false;
+            });
+            return false;
+        });
+    }
+};
+```
+
+This ensures:
+- Clean resource cleanup from the previous process
+- Proper signal handling state for the next process
+- Main thread context for GTK/GIO applications
+
+### Argument Parsing
+
+Command lines are parsed using a bash-compatible quote-aware splitter:
+
+```csharp
+private static List<string> SplitCommandLine(string commandLine)
+{
+    var tokens = new List<string>();
+    string current = string.Empty;
+    bool inQuotes = false;
+    var i = 0;
+
+    while (i < commandLine.Length)
+    {
+        var ch = commandLine[i];
+
+        if (ch == '"')
+        {
+            inQuotes = !inQuotes;
+            i++;
+        }
+        else if (char.IsWhiteSpace(ch) && !inQuotes)
+        {
+            if (current.Length > 0)
+            {
+                tokens.Add(current);
+                current = string.Empty;
+            }
+            i++;
+        }
+        else
+        {
+            current += ch;
+            i++;
+        }
+    }
+
+    if (current.Length > 0)
+    {
+        tokens.Add(current);
+    }
+
+    return tokens;
+}
+```
+
+This correctly handles arguments with spaces when wrapped in double quotes, matching bash behavior.

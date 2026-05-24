@@ -34,3 +34,8 @@ row.command-failed label,
 row.command-failed image.dim-label {
     color: white;
 }
+.executable-card {
+    background-color: mix(@theme_bg_color, @theme_fg_color, 0.03);
+    border-radius: 12px;
+    padding: 2px;
+}
