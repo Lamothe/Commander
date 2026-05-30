@@ -25,6 +25,7 @@ public class Application
     {
         _app = Adw.Application.New("com.lamothe.Commander", Gio.ApplicationFlags.FlagsNone);
         _app.OnActivate += (sender, args) => OnActivate();
+        _app.OnShutdown += (sender, args) => StopAllProcesses();
     }
 
     public int Run()
@@ -592,6 +593,8 @@ public class Application
 
     private static void RunCommand(CommandInfo commandInfo)
     {
+        commandInfo.UserRequestedStop = false;
+
         // Ensure the buffer exists so it can capture logs in the background!
         commandInfo.OutputBuffer ??= TextBuffer.New(null);
 
@@ -686,7 +689,20 @@ public class Application
             commandInfo.ExitCode = process.ExitCode;
             commandInfo.Process = null;
 
-            if (commandInfo.ExitCode.HasValue && commandInfo.ExitCode != 0)
+            if (commandInfo.UserRequestedStop)
+            {
+                // User-initiated stop — clean shutdown, not a failure
+                commandInfo.ExitCode = 0;
+                process.Dispose();
+                commandInfo.StatusChanged?.Invoke();
+                commandInfo.ButtonsChanged?.Invoke();
+                GLib.Functions.IdleAdd(0, () =>
+                {
+                    UpdateOutput(commandInfo, "Process stopped by user.\n");
+                    return false;
+                });
+            }
+            else if (commandInfo.ExitCode.HasValue && commandInfo.ExitCode != 0)
             {
                 // Execution failed, stop here
                 UpdateOutput(commandInfo, $"Executable {index + 1} failed with exit code {commandInfo.ExitCode}. Stopping.\n");
@@ -811,6 +827,7 @@ public class Application
     {
         if (commandInfo.Process is { HasExited: false } process)
         {
+            commandInfo.UserRequestedStop = true;
             try
             {
                 // Send SIGTERM (15) instead of process.Kill()
@@ -827,6 +844,14 @@ public class Application
             {
                 Console.Error.WriteLine($"Failed to stop process: {ex.Message}");
             }
+        }
+    }
+
+    private void StopAllProcesses()
+    {
+        foreach (var commandInfo in _commands)
+        {
+            StopProcess(commandInfo);
         }
     }
 
@@ -917,6 +942,7 @@ public class CommandInfo(string name, List<string> executables, string? workingD
     public Action? ButtonsChanged { get; set; }
     public ScrolledWindow? TerminalScroll { get; set; }
     public bool IsAutoScrolling { get; set; } = true;
+    public bool UserRequestedStop { get; set; }
 }
 
 public class CommandData
