@@ -1,4 +1,3 @@
-using System.Data;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -10,10 +9,12 @@ public class Application
 {
     private readonly Adw.Application _app;
     private List<CommandInfo> _commands = [];
-    private Adw.ApplicationWindow _window = null!;
+    private Adw.ApplicationWindow? _window;
     private Adw.NavigationView _navView = null!;
     private ListBox _listBox = null!;
     private readonly Dictionary<Widget, CommandInfo> _rowToCommandMap = new();
+    private bool _isInitialAutostart;
+
     private static string GetStoragePath()
     {
         var appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "commander");
@@ -23,7 +24,9 @@ public class Application
 
     public Application()
     {
+        _isInitialAutostart = Environment.GetCommandLineArgs().Any(a => a == "--autostart");
         _app = Adw.Application.New("com.lamothe.Commander", Gio.ApplicationFlags.FlagsNone);
+        _app.OnStartup += (sender, args) => OnStartup();
         _app.OnActivate += (sender, args) => OnActivate();
         _app.OnShutdown += (sender, args) => StopAllProcesses();
     }
@@ -33,22 +36,56 @@ public class Application
         return _app.RunWithSynchronizationContext(null);
     }
 
-    private static async Task OnStartup()
+    private void OnStartup()
     {
-        var cssProvider = CssProvider.New();
+        InitializeStyles();
+        LoadCommands();
+        SyncAutostartDesktopFile(_commands.Any(c => c.RunAsService));
+
+        // Start "run as service" commands at launch (even when started hidden at login)
+        foreach (var command in _commands.Where(c => c.RunAsService))
+        {
+            RunCommand(command);
+        }
+    }
+
+    private static void InitializeStyles()
+    {
         var cssPath = Path.Combine(AppContext.BaseDirectory, "Commander.css");
-        cssProvider.LoadFromString(await global::System.IO.File.ReadAllTextAsync(cssPath));
-        StyleContext.AddProviderForDisplay(
-            Gdk.Display.GetDefault()!,
-            cssProvider,
-            800
-        );
+        if (File.Exists(cssPath))
+        {
+            var cssProvider = CssProvider.New();
+            cssProvider.LoadFromString(File.ReadAllText(cssPath));
+            StyleContext.AddProviderForDisplay(
+                Gdk.Display.GetDefault()!,
+                cssProvider,
+                800
+            );
+        }
     }
 
     private void OnActivate()
     {
-        _ = OnStartup();
-        LoadCommands();
+        EnsureWindow();
+
+        if (_isInitialAutostart)
+        {
+            // When started in autostart mode, keep the window hidden initially.
+            _isInitialAutostart = false;
+        }
+        else
+        {
+            // Normal launch or user opening the application: present the window.
+            _window!.Present();
+        }
+    }
+
+    private void EnsureWindow()
+    {
+        if (_window != null)
+        {
+            return;
+        }
 
         _navView = Adw.NavigationView.New();
 
@@ -61,7 +98,59 @@ public class Application
         _window.SetTitle("Commander");
         _window.SetDefaultSize(1000, 700);
         _window.SetContent(_navView);
-        _window.Present();
+
+        _window.OnCloseRequest += (sender, args) =>
+        {
+            // If any service is configured or any process is running, hide the window to keep the background process running.
+            if (_commands.Any(c => c.RunAsService || c.Process is { HasExited: false }))
+            {
+                _window.SetVisible(false);
+                return true;
+            }
+
+            // Otherwise, allow the window to close and application to exit.
+            return false;
+        };
+    }
+
+    private static void SyncAutostartDesktopFile(bool hasServices)
+    {
+        try
+        {
+            var autostartDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config", "autostart");
+            var autostartPath = Path.Combine(autostartDir, "com.lamothe.Commander-autostart.desktop");
+
+            if (hasServices)
+            {
+                Directory.CreateDirectory(autostartDir);
+                var exePath = Path.Combine(AppContext.BaseDirectory, "Commander.Gnome");
+                if (!File.Exists(exePath))
+                {
+                    exePath = Environment.ProcessPath ?? exePath;
+                }
+
+                var content = $"""
+[Desktop Entry]
+Type=Application
+Name=Commander
+Exec={exePath} --autostart
+Icon=com.lamothe.Commander
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Categories=Utility;
+
+""";
+                File.WriteAllText(autostartPath, content);
+            }
+            else if (File.Exists(autostartPath))
+            {
+                File.Delete(autostartPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to sync autostart desktop file: {ex.Message}");
+        }
     }
 
     private Adw.ToolbarView BuildMainView()
@@ -96,7 +185,7 @@ public class Application
         addButton.Valign = Align.Center;
         addButton.OnClicked += (_, _) => ShowCommandDetailPage(new CommandInfo("New Command", [], "", true) { IsNew = true });
 
-        // The Magic: Use a PreferencesGroup to create the split header layout
+        // Use a PreferencesGroup to create the split header layout
         var prefsGroup = Adw.PreferencesGroup.New();
         prefsGroup.Title = "Commands";       // Puts the text on the left
         prefsGroup.HeaderSuffix = addButton; // Puts the flat button on the right
@@ -194,8 +283,8 @@ public class Application
 
             row.SetSubtitle(isRunning
                 ? "Running"
-                : commandInfo.Process != null
-                    ? commandInfo.ExitCode.HasValue && commandInfo.ExitCode != 0
+                : commandInfo.ExitCode.HasValue
+                    ? commandInfo.ExitCode.Value != 0
                         ? $"Failed ({commandInfo.ExitCode})"
                         : "Stopped"
                     : "Idle");
@@ -349,6 +438,14 @@ public class Application
         workingDirectoryRow.Hexpand = true;
         infoGroup.Add(workingDirectoryRow);
 
+        // Select the first executable row
+        var serviceSwitchRow = Adw.SwitchRow.New();
+        serviceSwitchRow.Title = "Run as a service";
+        serviceSwitchRow.Subtitle = "Start automatically at login and restart if it exits";
+        serviceSwitchRow.Active = commandInfo.RunAsService;
+        serviceSwitchRow.Hexpand = true;
+        infoGroup.Add(serviceSwitchRow);
+
         contentBox.Append(infoGroup);
 
         if (!commandInfo.IsNew)
@@ -484,6 +581,7 @@ public class Application
                 commandInfo.Name = newName;
                 commandInfo.Executables = allExecutables;
                 commandInfo.WorkingDirectory = workingDirectoryRow.GetText()?.Trim() ?? string.Empty;
+                commandInfo.RunAsService = serviceSwitchRow.Active;
 
                 if (commandInfo.IsNew)
                 {
@@ -539,7 +637,6 @@ public class Application
                 dialog.Present(_window);
             };
 
-
             footerBox.Append(removeBtn);
         }
         footerBox.Append(spacer);
@@ -593,6 +690,11 @@ public class Application
 
     private static void RunCommand(CommandInfo commandInfo)
     {
+        if (commandInfo.Process is { HasExited: false })
+        {
+            return;
+        }
+
         commandInfo.UserRequestedStop = false;
 
         // Ensure the buffer exists so it can capture logs in the background!
@@ -671,14 +773,14 @@ public class Application
 
         process.OutputDataReceived += (sender, e) =>
         {
-            if (!string.IsNullOrEmpty(e.Data))
+            if (e.Data != null)
             {
                 UpdateOutput(commandInfo, e.Data + "\n");
             }
         };
         process.ErrorDataReceived += (sender, e) =>
         {
-            if (!string.IsNullOrEmpty(e.Data))
+            if (e.Data != null)
             {
                 UpdateOutput(commandInfo, e.Data + "\n");
             }
@@ -702,9 +804,39 @@ public class Application
                     return false;
                 });
             }
+            else if (commandInfo.ExitCode == 0 && index < commandInfo.Executables.Count - 1)
+            {
+                // Intermediate step succeeded, advance to next executable
+                process.Dispose();
+                GLib.Functions.IdleAdd(0, () =>
+                {
+                    ExecuteNextExecutable(commandInfo, index + 1);
+                    return false;
+                });
+            }
+            else if (commandInfo.RunAsService)
+            {
+                // Service mode: restart the sequence after 5 seconds
+                process.Dispose();
+                commandInfo.StatusChanged?.Invoke();
+                commandInfo.ButtonsChanged?.Invoke();
+                GLib.Functions.IdleAdd(0, () =>
+                {
+                    UpdateOutput(commandInfo, $"Service stopped (exit {commandInfo.ExitCode}); restarting in 5 seconds...\n");
+                    GLib.Functions.TimeoutAdd(5000, uint.MaxValue, () =>
+                    {
+                        if (commandInfo.RunAsService && !commandInfo.UserRequestedStop)
+                        {
+                            RunCommand(commandInfo);
+                        }
+                        return false;
+                    });
+                    return false;
+                });
+            }
             else if (commandInfo.ExitCode.HasValue && commandInfo.ExitCode != 0)
             {
-                // Execution failed, stop here
+                // Non-service execution failed, stop here
                 UpdateOutput(commandInfo, $"Executable {index + 1} failed with exit code {commandInfo.ExitCode}. Stopping.\n");
                 commandInfo.StatusChanged?.Invoke();
                 commandInfo.ButtonsChanged?.Invoke();
@@ -717,11 +849,13 @@ public class Application
             }
             else
             {
-                // Success, dispose and defer next executable to the main thread
+                // Final executable succeeded
                 process.Dispose();
+                commandInfo.StatusChanged?.Invoke();
+                commandInfo.ButtonsChanged?.Invoke();
                 GLib.Functions.IdleAdd(0, () =>
                 {
-                    ExecuteNextExecutable(commandInfo, index + 1);
+                    UpdateOutput(commandInfo, "All executables completed successfully.\n");
                     return false;
                 });
             }
@@ -738,7 +872,6 @@ public class Application
         catch (Exception ex)
         {
             UpdateOutput(commandInfo, $"Error starting process: {ex.Message}\n");
-            // On error, stop execution
             commandInfo.ExitCode = -1;
             commandInfo.Process = null;
             commandInfo.StatusChanged?.Invoke();
@@ -825,9 +958,9 @@ public class Application
 
     private static void StopProcess(CommandInfo commandInfo)
     {
+        commandInfo.UserRequestedStop = true;
         if (commandInfo.Process is { HasExited: false } process)
         {
-            commandInfo.UserRequestedStop = true;
             try
             {
                 // Send SIGTERM (15) instead of process.Kill()
@@ -855,10 +988,8 @@ public class Application
         }
     }
 
-    // Add this native import inside your Application class
     [DllImport("libc.so.6", SetLastError = true)]
     private static extern int kill(int pid, int sig);
-
 
     private void SaveCommands()
     {
@@ -874,7 +1005,8 @@ public class Application
             {
                 Name = c.Name,
                 ExecutableEntries = c.Executables,
-                WorkingDirectory = c.WorkingDirectory
+                WorkingDirectory = c.WorkingDirectory,
+                RunAsService = c.RunAsService
             }).ToList();
 
             var json = JsonSerializer.Serialize(commandsToSave, new JsonSerializerOptions
@@ -883,6 +1015,7 @@ public class Application
             });
 
             File.WriteAllText(GetStoragePath(), json);
+            SyncAutostartDesktopFile(_commands.Any(c => c.RunAsService));
         }
         catch (Exception ex)
         {
@@ -916,7 +1049,10 @@ public class Application
                                            .ToList();
                     }
 
-                    return new CommandInfo(cd.Name, entries ?? [], cd.WorkingDirectory, false);
+                    return new CommandInfo(cd.Name, entries ?? [], cd.WorkingDirectory, false)
+                    {
+                        RunAsService = cd.RunAsService
+                    };
                 })];
             }
         }
@@ -927,13 +1063,12 @@ public class Application
     }
 }
 
-
-
 public class CommandInfo(string name, List<string> executables, string? workingDirectory, bool isNew)
 {
     public string Name { get; set; } = name;
     public List<string> Executables { get; set; } = executables ?? [];
     public string? WorkingDirectory { get; set; } = workingDirectory;
+    public bool RunAsService { get; set; }
     public bool IsNew { get; set; } = isNew;
     public Process? Process { get; set; }
     public int? ExitCode { get; set; }
@@ -957,6 +1092,7 @@ public class CommandData
     public string? LegacyExecutables { get; set; }
 
     public string? WorkingDirectory { get; set; }
+    public bool RunAsService { get; set; }
 }
 
 record ExecutableUiEntry(Adw.EntryRow CommandEntry, List<Adw.EntryRow> ArgumentEntries);

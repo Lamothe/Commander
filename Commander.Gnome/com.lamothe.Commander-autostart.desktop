@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Commander
+Exec=/home/michael/Projects/Commander/Commander.Gnome/bin/Debug/net10.0/Commander.Gnome --autostart
+Icon=com.lamothe.Commander
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Categories=Utility;
