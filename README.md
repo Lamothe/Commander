@@ -11,7 +11,7 @@ A modern, elegant .NET 10 GNOME application for managing and monitoring long-run
 Commander is built as a dual-project solution to address technical constraints:
 
 - **Commander.Gnome**: The primary GNOME application built with Gir.Core (GTK4/Adwaita), providing the UI and process orchestration.
-- **Commander.ProcessWrapper**: A lightweight native wrapper process that ensures clean signal propagation (SIGTERM/SIGKILL) to child processes, enabling graceful shutdown without leaving orphaned subprocesses.
+- **Commander.ProcessWrapper**: A lightweight wrapper process that supervises each command in its own process group and forwards termination signals (SIGTERM/SIGINT/SIGHUP) to the whole group, enabling graceful shutdown without leaving orphaned subprocesses.
 
 ## Features
 
@@ -21,7 +21,7 @@ Commander is built as a dual-project solution to address technical constraints:
 - **Process Control**: Start and stop individual processes with isolated controls.
 - **Live Terminal Output**: Monitor real-time stdout/stderr for each command with automatic truncation to the last 500 lines and auto-scroll support.
 - **Adwaita UI**: Native GNOME styling with heavy rounded corners, generous padding, and consistent theming.
-- **Graceful Termination**: Uses `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the wrapper to ensure child processes receive termination signals when the parent exits.
+- **Graceful Termination**: Uses `prctl(PR_SET_PDEATHSIG, SIGTERM)` and a dedicated process group per command in the wrapper, so the whole process tree receives termination signals when Commander exits or a stop request signals the wrapper.
 - **Cross-Platform**: Built on .NET 10 with Gir.Core for GTK4 integration, compatible with Fedora and other Linux distributions.
 - **Persistence**: Commands are automatically saved to `~/.local/share/commander/commands.json`.
 - **Reliable Asset Loading**: CSS files and native wrappers are loaded from `AppContext.BaseDirectory` to work correctly when launched from desktop menu or pinned app.
@@ -32,9 +32,8 @@ Commander is built as a dual-project solution to address technical constraints:
 - **Gir.Core**: Idiomatic .NET bindings for GTK4 and Adwaita (`GirCore.Adw-1`).
 - **Adwaita CSS**: Custom styling for terminal output with a dark monospace theme and rounded corners (loaded from `AppContext.BaseDirectory` at runtime)
 - **Native Interop**: P/Invoke to `libc.so.6` for:
-  - `prctl()` in the wrapper to set process death signals
-  - `execvp()` in the wrapper to replace itself with the target executable
-  - `kill()` in the main app to send SIGTERM for graceful termination
+  - `prctl()` and `setpgid()` in the wrapper to set process death signals and give each command its own process group
+  - `kill()` in the wrapper and the main app to forward/send SIGTERM for graceful termination
 - **Async Process Management**: Non-blocking command execution with robust event-driven output handling
 - **Desktop Integration**: MSBuild targets for automatic desktop file installation and icon deployment
 
@@ -133,15 +132,16 @@ When a working directory is specified and the executable path is relative (not s
 
 - **Start**:
   - If the command has multiple executables, they run sequentially. Execution stops immediately if any executable exits with a non-zero exit code (fail-fast behavior).
-  - For each executable, the app launches `Commander.ProcessWrapper` (a native wrapper) using an absolute path from `AppContext.BaseDirectory`
-  - The wrapper calls `prctl(PR_SET_PDEATHSIG, SIGTERM)` to ensure child processes receive SIGTERM when the wrapper exits
-  - The wrapper then calls `execvp()` to replace itself with the target executable
+  - For each executable, the app launches `Commander.ProcessWrapper` (a lightweight wrapper) using an absolute path from `AppContext.BaseDirectory`
+  - The wrapper calls `setpgid()` to give the command its own process group, so a signal sent to the wrapper reaches the entire tree
+  - It calls `prctl(PR_SET_PDEATHSIG, SIGTERM)` to ensure it is signalled when Commander exits, then starts the target executable as a child and waits for it, exiting with the child's exit code
   - The command line string is parsed using a bash-compatible quote-aware splitter, and arguments are passed individually via `ArgumentList` to preserve spaces and special characters
   - Sequential executables are deferred to the GTK main loop with a small delay to ensure clean resource cleanup between processes
   - This ensures process isolation and prevents shell injection issues
 
 - **Stop**:
   - Sends `SIGTERM` (signal 15) via P/Invoke to `kill()` to request graceful termination
+  - The wrapper forwards the signal to the command's whole process group, so nested processes (for example `dotnet watch` -> build -> app) stop together without orphans
   - If the process doesn't terminate within a reasonable time, `process.Kill()` (SIGKILL) is used as a fallback
 
 - **Persistence**: Commands are saved to and loaded from `~/.local/share/commander/commands.json` (JSON format)
@@ -163,7 +163,7 @@ Commander/
 │   └── README.md                   # Module-level documentation
 │
 ├── Commander.ProcessWrapper/       # Native Process Wrapper
-│   ├── Program.cs                  # prctl/execvp implementation for clean signal propagation
+│   ├── Program.cs                  # prctl/setpgid supervisor forwarding signals to the command's process group
 │   └── Commander.ProcessWrapper.csproj
 │
 ├── .vscode/                        # VS Code debugging configuration
@@ -194,7 +194,7 @@ Commander prioritizes elegance and correctness:
 - **Strict Type Safety**: Leverages C#'s nullable reference types and modern pattern matching
 - **Modern Paradigms**: Uses lambda expressions, top-level statements, and collection expressions
 - **Adwaita Compliance**: Follows GNOME HIG with proper spacing, corners, and color variables
-- **Robust Process Management**: The wrapper pattern ensures signals reach the target process directly, avoiding shell-related issues and zombie processes
+- **Robust Process Management**: The wrapper pattern gives every command its own process group and forwards signals across it, so nested process trees stop cleanly without orphans or zombie processes
 - **Natural Command Input**: Users enter full command lines with arguments in a single field. A quote-aware parser handles argument splitting at execution time, eliminating tedious copy-paste workflows.
 - **Automatic Desktop Integration**: MSBuild targets handle desktop file installation and icon deployment
 
