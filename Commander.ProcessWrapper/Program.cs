@@ -23,7 +23,7 @@ if (args.Length == 0) return 1;
 if (OperatingSystem.IsWindows())
 {
     RunWindows(args);
-    return;
+    return 0; // RunWindows exits the process itself; never reached.
 }
 
 // Linux signal numbers. The PosixSignal enum is a cross-platform abstraction
