@@ -47,6 +47,40 @@ public class Application
         {
             RunCommand(command);
         }
+
+        // Watchdog: restart a service command whose exit went unnoticed (e.g. a
+        // missed Exited event). Requires two consecutive quiet ticks before
+        // intervening so a queued Exited handler is never double-started.
+        GLib.Functions.TimeoutAdd(30_000, uint.MaxValue, () =>
+        {
+            foreach (var command in _commands.Where(c => c.RunAsService))
+            {
+                if (command.UserRequestedStop || command.StoppedByUser || command.RestartPending || command.Process is { HasExited: false })
+                {
+                    command.WatchdogMisses = 0;
+                    continue;
+                }
+
+                command.WatchdogMisses++;
+                if (command.WatchdogMisses < 2)
+                {
+                    continue;
+                }
+
+                command.WatchdogMisses = 0;
+                if (command.Process is { HasExited: true } dead)
+                {
+                    command.ExitCode = dead.ExitCode;
+                    dead.Dispose();
+                    command.Process = null;
+                }
+
+                UpdateOutput(command, "Watchdog: process is not running and no exit was reported; restarting...\n");
+                RunCommand(command);
+            }
+
+            return true;
+        });
     }
 
     private static void InitializeStyles()
@@ -493,7 +527,7 @@ Categories=Utility;
             // Helper to update button states
             void UpdateButtons()
             {
-                bool isRunning = commandInfo.Process is { HasExited: false };
+                bool isRunning = commandInfo.Process is { HasExited: false } || commandInfo.RestartPending;
                 stopBtn.Sensitive = isRunning;
                 startBtn.Sensitive = !isRunning;
             }
@@ -696,6 +730,9 @@ Categories=Utility;
         }
 
         commandInfo.UserRequestedStop = false;
+        commandInfo.StoppedByUser = false;
+        commandInfo.RestartPending = false;
+        commandInfo.WatchdogMisses = 0;
 
         // Ensure the buffer exists so it can capture logs in the background!
         commandInfo.OutputBuffer ??= TextBuffer.New(null);
@@ -788,19 +825,29 @@ Categories=Utility;
 
         process.Exited += (sender, e) =>
         {
+            if (!ReferenceEquals(commandInfo.Process, process))
+            {
+                // A new process was started before this handler ran; the event
+                // is stale and must not touch the command's current state.
+                process.Dispose();
+                return;
+            }
+
             commandInfo.ExitCode = process.ExitCode;
             commandInfo.Process = null;
 
             if (commandInfo.UserRequestedStop)
             {
-                // User-initiated stop — clean shutdown, not a failure
+                // User-initiated stop — clean shutdown, not a failure.
+                // Consume the flag so a later unexpected exit still restarts.
                 commandInfo.ExitCode = 0;
+                commandInfo.UserRequestedStop = false;
                 process.Dispose();
-                commandInfo.StatusChanged?.Invoke();
-                commandInfo.ButtonsChanged?.Invoke();
                 GLib.Functions.IdleAdd(0, () =>
                 {
                     UpdateOutput(commandInfo, "Process stopped by user.\n");
+                    commandInfo.StatusChanged?.Invoke();
+                    commandInfo.ButtonsChanged?.Invoke();
                     return false;
                 });
             }
@@ -816,32 +863,26 @@ Categories=Utility;
             }
             else if (commandInfo.RunAsService)
             {
-                // Service mode: restart the sequence after 5 seconds
+                // Service mode: restart with exponential backoff after a crash
+                var delay = ComputeRestartDelay(commandInfo);
                 process.Dispose();
-                commandInfo.StatusChanged?.Invoke();
-                commandInfo.ButtonsChanged?.Invoke();
                 GLib.Functions.IdleAdd(0, () =>
                 {
-                    UpdateOutput(commandInfo, $"Service stopped (exit {commandInfo.ExitCode}); restarting in 5 seconds...\n");
-                    GLib.Functions.TimeoutAdd(5000, uint.MaxValue, () =>
-                    {
-                        if (commandInfo.RunAsService && !commandInfo.UserRequestedStop)
-                        {
-                            RunCommand(commandInfo);
-                        }
-                        return false;
-                    });
+                    commandInfo.StatusChanged?.Invoke();
+                    commandInfo.ButtonsChanged?.Invoke();
+                    UpdateOutput(commandInfo, $"Service stopped (exit {commandInfo.ExitCode}); restarting in {delay / 1000} seconds...\n");
+                    ScheduleRestart(commandInfo, delay);
                     return false;
                 });
             }
             else if (commandInfo.ExitCode.HasValue && commandInfo.ExitCode != 0)
             {
                 // Non-service execution failed, stop here
-                UpdateOutput(commandInfo, $"Executable {index + 1} failed with exit code {commandInfo.ExitCode}. Stopping.\n");
-                commandInfo.StatusChanged?.Invoke();
-                commandInfo.ButtonsChanged?.Invoke();
                 GLib.Functions.IdleAdd(0, () =>
                 {
+                    UpdateOutput(commandInfo, $"Executable {index + 1} failed with exit code {commandInfo.ExitCode}. Stopping.\n");
+                    commandInfo.StatusChanged?.Invoke();
+                    commandInfo.ButtonsChanged?.Invoke();
                     UpdateOutput(commandInfo, $"Process exited with code {commandInfo.ExitCode}.\n");
                     process.Dispose();
                     return false;
@@ -851,11 +892,11 @@ Categories=Utility;
             {
                 // Final executable succeeded
                 process.Dispose();
-                commandInfo.StatusChanged?.Invoke();
-                commandInfo.ButtonsChanged?.Invoke();
                 GLib.Functions.IdleAdd(0, () =>
                 {
                     UpdateOutput(commandInfo, "All executables completed successfully.\n");
+                    commandInfo.StatusChanged?.Invoke();
+                    commandInfo.ButtonsChanged?.Invoke();
                     return false;
                 });
             }
@@ -867,15 +908,31 @@ Categories=Utility;
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             commandInfo.Process = process;
+            if (index == 0)
+            {
+                commandInfo.ProcessStartedAt = DateTime.UtcNow;
+            }
+            commandInfo.WatchdogMisses = 0;
             commandInfo.StatusChanged?.Invoke();
+            commandInfo.ButtonsChanged?.Invoke();
         }
         catch (Exception ex)
         {
             UpdateOutput(commandInfo, $"Error starting process: {ex.Message}\n");
             commandInfo.ExitCode = -1;
             commandInfo.Process = null;
+            commandInfo.ProcessStartedAt = null;
             commandInfo.StatusChanged?.Invoke();
             commandInfo.ButtonsChanged?.Invoke();
+
+            if (commandInfo.RunAsService)
+            {
+                // Start failures must back off too, otherwise a broken command
+                // would be retried by the watchdog forever.
+                var delay = ComputeRestartDelay(commandInfo);
+                UpdateOutput(commandInfo, $"Start failed; retrying in {delay / 1000} seconds...\n");
+                ScheduleRestart(commandInfo, delay);
+            }
         }
     }
 
@@ -958,26 +1015,71 @@ Categories=Utility;
 
     private static void StopProcess(CommandInfo commandInfo)
     {
-        commandInfo.UserRequestedStop = true;
-        if (commandInfo.Process is { HasExited: false } process)
-        {
-            try
-            {
-                // Send SIGTERM (15) instead of process.Kill()
-                // This lets the wrapper shut down its own children cleanly
-                var result = kill(process.Id, 15);
+        // Record the user's intent: stay stopped until an explicit start. This
+        // also cancels a pending auto-restart, so pressing Stop on an idle
+        // service cancels a queued "restarting in N seconds" timer.
+        commandInfo.StoppedByUser = true;
+        commandInfo.RestartPending = false;
+        commandInfo.WatchdogMisses = 0;
 
-                if (result != 0)
-                {
-                    // Fallback just in case the process is completely frozen
-                    process.Kill();
-                }
-            }
-            catch (Exception ex)
+        if (commandInfo.Process is not { HasExited: false } process)
+        {
+            // Nothing to stop; do not set UserRequestedStop, so the exit
+            // handler of an in-flight stop is unaffected.
+            return;
+        }
+
+        commandInfo.UserRequestedStop = true;
+
+        try
+        {
+            // Send SIGTERM (15) instead of process.Kill()
+            // This lets the wrapper shut down its own children cleanly
+            var result = kill(process.Id, 15);
+
+            if (result != 0)
             {
-                Console.Error.WriteLine($"Failed to stop process: {ex.Message}");
+                // Fallback just in case the process is completely frozen
+                process.Kill();
             }
         }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to stop process: {ex.Message}");
+        }
+    }
+
+    private static int ComputeRestartDelay(CommandInfo commandInfo)
+    {
+        // Exponential backoff for repeated failures: 5s, 10s, 20s, ... capped
+        // at 5 minutes. A run that lasted at least five minutes counts as
+        // stable and resets the backoff.
+        if (commandInfo.ProcessStartedAt is { } startedAt && DateTime.UtcNow - startedAt >= TimeSpan.FromMinutes(5))
+        {
+            commandInfo.RestartAttempts = 0;
+        }
+
+        var delay = 5000d * Math.Pow(2, commandInfo.RestartAttempts);
+        commandInfo.RestartAttempts++;
+        return (int)Math.Min(delay, 300_000);
+    }
+
+    private static void ScheduleRestart(CommandInfo commandInfo, int delay)
+    {
+        // Schedule a service restart on the main loop. A user stop cancels it
+        // by clearing RestartPending before the timer fires.
+        commandInfo.RestartPending = true;
+        GLib.Functions.TimeoutAdd(delay, uint.MaxValue, () =>
+        {
+            if (!commandInfo.RestartPending || commandInfo.UserRequestedStop)
+            {
+                return false;
+            }
+
+            commandInfo.RestartPending = false;
+            RunCommand(commandInfo);
+            return false;
+        });
     }
 
     private void StopAllProcesses()
@@ -1078,6 +1180,15 @@ public class CommandInfo(string name, List<string> executables, string? workingD
     public ScrolledWindow? TerminalScroll { get; set; }
     public bool IsAutoScrolling { get; set; } = true;
     public bool UserRequestedStop { get; set; }
+
+    // Persistent record that the user's last action for this command was a
+    // stop; keeps the watchdog from resurrecting a deliberately stopped
+    // service. Cleared by RunCommand (an explicit or scheduled start).
+    public bool StoppedByUser { get; set; }
+    public bool RestartPending { get; set; }
+    public int RestartAttempts { get; set; }
+    public int WatchdogMisses { get; set; }
+    public DateTime? ProcessStartedAt { get; set; }
 }
 
 public class CommandData
