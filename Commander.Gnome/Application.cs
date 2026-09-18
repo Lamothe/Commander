@@ -1035,7 +1035,7 @@ Categories=Utility;
         {
             // Send SIGTERM (15) instead of process.Kill()
             // This lets the wrapper shut down its own children cleanly
-            var result = kill(process.Id, 15);
+            var result = SendTerminationSignal(process);
 
             if (result != 0)
             {
@@ -1092,6 +1092,48 @@ Categories=Utility;
 
     [DllImport("libc.so.6", SetLastError = true)]
     private static extern int kill(int pid, int sig);
+
+    private static int SendTerminationSignal(Process process)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // No POSIX signals on Windows. Terminating the wrapper closes its
+            // job object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE), which terminates
+            // the entire child process tree it manages.
+            return WindowsTerminateProcess(process.Id) ? 0 : -1;
+        }
+
+        return kill(process.Id, 15);
+    }
+
+    private const uint PROCESS_TERMINATE = 0x0001;
+
+    private static bool WindowsTerminateProcess(int pid)
+    {
+        var handle = OpenProcess(PROCESS_TERMINATE, false, pid);
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        try
+        {
+            return TerminateProcess(handle, 1);
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr hObject);
 
     private void SaveCommands()
     {
